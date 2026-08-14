@@ -83,6 +83,13 @@ int gateware_fpga_type = 2;
 unsigned char hpsdrdata[1032];
 unsigned char broadcastReply[60];
 void write_rb_stream(unsigned char* buffer);
+
+// Start-command retry state: the last Start packet received from an SDR
+// client is kept so the daemon can re-send it to the FPGA if no IQ frames
+// arrive (a manual "second Start" always fixed the stalled stream).
+unsigned char saved_start_packet[1032];
+int have_saved_start = 0;
+time_t last_frame_time = 0;
     
 int running = 0;
 int fd;									/* our socket */

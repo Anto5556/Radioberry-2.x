@@ -133,6 +133,31 @@ void start_rb_pa_thread() {
 	pthread_create(&pid, NULL, rb_pa_thread, NULL);
 }
 
+//
+// Watchdog: if the daemon is told to run (Start received) but the FPGA
+// does not deliver any IQ frame within a couple of seconds, re-send the
+// last Start command to the FPGA. This makes the first Start after a
+// reboot always take: previously a stalled first Start left the waterfall
+// frozen until the user pressed Start again.
+//
+static void *rb_start_retry_thread(void *arg) {
+	while (1) {
+		usleep(1000000); // check every second
+		if (!running || !have_saved_start) continue;
+		if (time(NULL) - last_frame_time > 2) {
+			fprintf(stderr, "No IQ frames for 2s; re-sending Start to FPGA \n");
+			write_rb_stream(saved_start_packet);
+			last_frame_time = time(NULL);
+		}
+	}
+	return NULL;
+}
+
+void start_rb_start_retry_thread() {
+	pthread_t pid;
+	pthread_create(&pid, NULL, rb_start_retry_thread, NULL);
+}
+
 uint16_t recalculateADCValue(uint16_t adc_in) {
 	// need to recalculate the AMP measurement for HL2 type of radio
 	float bridge_volt = 0.018139; float refvoltage = 3.3f; int adc_cal_offset = 0;
@@ -148,6 +173,7 @@ uint16_t recalculateADCValue(uint16_t adc_in) {
 void getStreamAndSendPacket() {
 	
 	if (read_stream(hpsdrdata) < 0) return; // fetching 1032 bytes of ethernet packet.
+	last_frame_time = time(NULL);
 	// the sdr data coming from the radioberry need to be enhanced with adddional information.
 	if (isAmplifierConnected()) {
 		if (!pa_temp_ok && (((hpsdrdata[11] & 0x01) == 0x01) | ((hpsdrdata[523] & 0x01) == 0x01))) {
@@ -303,6 +329,9 @@ void handlePacket(unsigned char* buffer){
 			{
 			fprintf(stderr, "Start Port %d \n", ntohs(remaddr.sin_port));
 			running = 1;
+			memcpy(saved_start_packet, buffer, 1032);
+			have_saved_start = 1;
+			last_frame_time = time(NULL);
 			if (sock_TCP_Client > -1)
 				fprintf(stderr, "SDR Program sends TCP Start command \n");
 			else
@@ -428,36 +457,16 @@ int main(int argc, char **argv)
 	isRPILinux();
 #endif
 
-	if (load_radioberry_gateware() < 0) {
-		fprintf(stderr,"Radioberry; loading radioberry gateware failed. \n");
-		return -1;
-	}
-	
-	driver_version = getFirmwareVersion();
-	//fprintf(stderr, "%06x\n", driver_version);
-	
-	int ret;
-	if (ret = init_stream() < 0) { return ret; }	
-	
-#ifdef _WIN32	
-	WSADATA wsa;
-	
-	if (WSAStartup(MAKEWORD(2,2),&wsa) != 0)
-	{
-		printf("Failed. Error Code : %d",WSAGetLastError());
-		return 1;
-	}
-#endif
-	
-	pthread_t pid1; 
-	pthread_create(&pid1, NULL, packetreader, NULL); 
-	
-	/* create a UDP socket */
-	if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-		printf("cannot create socket %d\n", fd);
-		perror("cannot create socket\n");
-		return 0;
-	}
+	//
+	// Create and bind the UDP socket as early as possible, before the
+	// ~1 second gateware load and the FTDI init below. If the socket does
+	// not exist yet, a Start command sent by an SDR client right after a
+	// reboot is silently dropped (UDP to an unbound port is discarded) and
+	// the client sees no stream until a second Start is sent. With the
+	// socket bound first, such a Start is queued in the kernel receive
+	// buffer (64 KiB SO_RCVBUF) and handled as soon as the packet reader
+	// starts.
+	//
 	struct timeval timeout;      
     timeout.tv_sec = 0;
     timeout.tv_usec = TIMEOUT_MS;
@@ -465,6 +474,12 @@ int main(int argc, char **argv)
 	
 	int optval;
 
+	/* create a UDP socket */
+	if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+		printf("cannot create socket %d\n", fd);
+		perror("cannot create socket\n");
+		return 0;
+	}
 #ifdef _WIN32
 	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (char *)&wtimeout,sizeof (int)) < 0)
 		perror("setsockopt failed\n");	
@@ -496,6 +511,30 @@ int main(int argc, char **argv)
 		perror("bind failed");
 		return 0;
 	}
+
+	if (load_radioberry_gateware() < 0) {
+		fprintf(stderr,"Radioberry; loading radioberry gateware failed. \n");
+		return -1;
+	}
+	
+	driver_version = getFirmwareVersion();
+	//fprintf(stderr, "%06x\n", driver_version);
+	
+	int ret;
+	if (ret = init_stream() < 0) { return ret; }	
+	
+#ifdef _WIN32	
+	WSADATA wsa;
+	
+	if (WSAStartup(MAKEWORD(2,2),&wsa) != 0)
+	{
+		printf("Failed. Error Code : %d",WSAGetLastError());
+		return 1;
+	}
+#endif
+	
+	pthread_t pid1; 
+	pthread_create(&pid1, NULL, packetreader, NULL); 
 	
 	if ((sock_TCP_Server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP )) < 0)
 	{
@@ -552,6 +591,8 @@ int main(int argc, char **argv)
 	start_temperature_thread();
 	
 	start_rb_pa_thread();
+	
+	start_rb_start_retry_thread();
 	
 	signal(SIGINT, handle_sigint);
 	
